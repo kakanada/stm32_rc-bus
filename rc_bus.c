@@ -3,8 +3,8 @@
  * @file    rc_bus.c
  * @brief   Реализация приёма i-BUS/S.BUS (см. rc_bus.h).
  * @author  Claude
- * @date    13.09.2026
- * @version 0.1
+ * @date    14.09.2026
+ * @version 0.2
  *
  * @copyright Copyright (c) 2026 Claude.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -24,7 +24,7 @@
 
 #define RCBUS_SBUS_FRAME_LEN         25U     /* длина кадра целиком, байт */
 #define RCBUS_SBUS_START_BYTE        0x0FU
-#define RCBUS_SBUS_END_BYTE          0x00U
+#define RCBUS_SBUS_END_BYTE_CLASSIC  0x00U   /* классический S.BUS без телеметрии */
 #define RCBUS_SBUS_FLAG_CH17         (1U << 0)
 #define RCBUS_SBUS_FLAG_CH18         (1U << 1)
 #define RCBUS_SBUS_FLAG_FRAME_LOST   (1U << 2)
@@ -39,6 +39,33 @@ static RCBUS_Handle_t s_pool[RCBUS_MAX_INSTANCES];
 /* ------------------------------------------------------------------------ */
 /*  Внутренние вспомогательные функции                                      */
 /* ------------------------------------------------------------------------ */
+
+/** Контрольная сумма семейства кадров i-BUS (и кадров каналов, и кадров
+ *  телеметрии на шине датчиков - см. rc_bus_telemetry.c): 0xFFFF минус сумма
+ *  первых len байт буфера. Общая для валидации входящих кадров и для
+ *  формирования исходящих (телеметрия) - протокол использует одну и ту же
+ *  формулу в обе стороны. */
+static uint16_t RCBUS_IBusChecksum16(const uint8_t *buf, uint16_t len)
+{
+    uint16_t sum = 0U;
+    for (uint16_t i = 0U; i < len; i++)
+    {
+        sum = (uint16_t)(sum + buf[i]);
+    }
+    return (uint16_t)(0xFFFFU - sum);
+}
+
+/** Значения байта конца кадра S.BUS, которые встречаются на практике:
+ *  0x00 - классический S.BUS без телеметрии; 0x04/0x14/0x24/0x34 - приёмник
+ *  в режиме S.BUS2 сигнализирует, что дальше по шине последует опрос
+ *  телеметрии в одном из слотов. Сама телеметрия S.BUS2 не разбирается (см.
+ *  "ЧЕГО ЗДЕСЬ НАРОЧНО НЕТ" в rc_bus.h) - здесь только чтобы не отбрасывать
+ *  как битый валидный кадр КАНАЛОВ от такого приёмника. */
+static uint8_t RCBUS_IsKnownSBusEndByte(uint8_t end_byte)
+{
+    return ((end_byte == 0x00U) || (end_byte == 0x04U) || (end_byte == 0x14U) ||
+            (end_byte == 0x24U) || (end_byte == 0x34U)) ? 1U : 0U;
+}
 
 /** Ищет свободный слот в пуле либо уже зарегистрированный по этому huart -
  *  для идемпотентности повторного RCBUS_Init(). NULL, если пул полон и
@@ -136,13 +163,8 @@ static uint8_t RCBUS_ParseIBusFrame(RCBUS_Handle_t *h, const uint8_t *buf, uint1
         return 0U;
     }
 
-    uint16_t sum = 0U;
-    for (uint16_t i = 0U; i < (RCBUS_IBUS_FRAME_LEN - 2U); i++)
-    {
-        sum = (uint16_t)(sum + buf[i]);
-    }
     uint16_t checksum_received = (uint16_t)((uint16_t)buf[30] | ((uint16_t)buf[31] << 8));
-    if ((uint16_t)(0xFFFFU - sum) != checksum_received)
+    if (RCBUS_IBusChecksum16(buf, RCBUS_IBUS_FRAME_LEN - 2U) != checksum_received)
     {
         return 0U; /* битый кадр - контрольная сумма не сошлась */
     }
@@ -152,11 +174,12 @@ static uint8_t RCBUS_ParseIBusFrame(RCBUS_Handle_t *h, const uint8_t *buf, uint1
         uint16_t raw = (uint16_t)((uint16_t)buf[2U + (2U * ch)] | ((uint16_t)buf[3U + (2U * ch)] << 8));
         h->channels[ch] = raw; /* i-BUS уже передаёт значение в шкале "как мкс" */
     }
-    h->channel_count        = RCBUS_IBUS_CHANNEL_COUNT;
-    h->digital_ch17         = 0U; /* у i-BUS дискретных каналов 17/18 нет */
-    h->digital_ch18         = 0U;
-    h->sbus_frame_lost_flag = 0U; /* у i-BUS нет явного флага в кадре */
-    h->sbus_failsafe_flag   = 0U;
+    h->channel_count          = RCBUS_IBUS_CHANNEL_COUNT;
+    h->digital_ch17           = 0U; /* у i-BUS дискретных каналов 17/18 нет */
+    h->digital_ch18           = 0U;
+    h->sbus2_telemetry_signal = 0U; /* у i-BUS этого поля не бывает */
+    h->sbus_frame_lost_flag   = 0U; /* у i-BUS нет явного флага в кадре */
+    h->sbus_failsafe_flag     = 0U;
     return 1U;
 }
 
@@ -176,7 +199,7 @@ static uint8_t RCBUS_ParseSBusFrame(RCBUS_Handle_t *h, const uint8_t *buf, uint1
     {
         return 0U;
     }
-    if ((buf[0] != RCBUS_SBUS_START_BYTE) || (buf[24] != RCBUS_SBUS_END_BYTE))
+    if ((buf[0] != RCBUS_SBUS_START_BYTE) || (RCBUS_IsKnownSBusEndByte(buf[24]) == 0U))
     {
         return 0U;
     }
@@ -195,11 +218,12 @@ static uint8_t RCBUS_ParseSBusFrame(RCBUS_Handle_t *h, const uint8_t *buf, uint1
     }
 
     uint8_t flags = buf[23];
-    h->channel_count        = RCBUS_SBUS_CHANNEL_COUNT;
-    h->digital_ch17         = ((flags & RCBUS_SBUS_FLAG_CH17) != 0U) ? 1U : 0U;
-    h->digital_ch18         = ((flags & RCBUS_SBUS_FLAG_CH18) != 0U) ? 1U : 0U;
-    h->sbus_frame_lost_flag = ((flags & RCBUS_SBUS_FLAG_FRAME_LOST) != 0U) ? 1U : 0U;
-    h->sbus_failsafe_flag   = ((flags & RCBUS_SBUS_FLAG_FAILSAFE) != 0U) ? 1U : 0U;
+    h->channel_count          = RCBUS_SBUS_CHANNEL_COUNT;
+    h->digital_ch17           = ((flags & RCBUS_SBUS_FLAG_CH17) != 0U) ? 1U : 0U;
+    h->digital_ch18           = ((flags & RCBUS_SBUS_FLAG_CH18) != 0U) ? 1U : 0U;
+    h->sbus_frame_lost_flag   = ((flags & RCBUS_SBUS_FLAG_FRAME_LOST) != 0U) ? 1U : 0U;
+    h->sbus_failsafe_flag     = ((flags & RCBUS_SBUS_FLAG_FAILSAFE) != 0U) ? 1U : 0U;
+    h->sbus2_telemetry_signal = (buf[24] != RCBUS_SBUS_END_BYTE_CLASSIC) ? 1U : 0U;
     return 1U;
 }
 
@@ -241,12 +265,13 @@ RCBUS_Handle_t *RCBUS_Init(const RCBUS_Config_t *config)
     h->channel_count = (config->protocol == RCBUS_PROTOCOL_IBUS)
         ? RCBUS_IBUS_CHANNEL_COUNT
         : RCBUS_SBUS_CHANNEL_COUNT;
-    h->digital_ch17         = 0U;
-    h->digital_ch18         = 0U;
-    h->sbus_frame_lost_flag = 0U;
-    h->sbus_failsafe_flag   = 0U;
-    h->frame_count          = 0U;
-    h->error_count          = 0U;
+    h->digital_ch17           = 0U;
+    h->digital_ch18           = 0U;
+    h->sbus2_telemetry_signal = 0U;
+    h->sbus_frame_lost_flag   = 0U;
+    h->sbus_failsafe_flag     = 0U;
+    h->frame_count            = 0U;
+    h->error_count            = 0U;
     /* Пока не пришёл первый кадр, таймаут потери связи отсчитывается с
      * момента Init(), а не "с начала времён" (иначе IsFrameLost() был бы
      * ложно 0 сразу после старта, до реального приёма хоть одного кадра). */
