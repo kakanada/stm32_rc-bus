@@ -9,11 +9,11 @@
  *          Ответ телеметрией на опрос по шине датчиков i-BUS - в отдельном
  *          модуле rc_bus_telemetry.h/.c (другая физическая роль: half-duplex
  *          запрос/ответ, а не приём непрерывного потока кадров каналов).
- * @author  Claude
- * @date    14.09.2026
- * @version 0.2
+ * @author  Mechanic
+ * @date    18.09.2026
+ * @version 0.3
  *
- * @copyright Copyright (c) 2026 Claude.
+ * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
  *            распространения - см. LICENSE / README.md в составе проекта.
  *
@@ -136,6 +136,9 @@ extern "C" {
 #ifndef RCBUS_MAX_INSTANCES
 #define RCBUS_MAX_INSTANCES         4U
 #endif
+#if RCBUS_MAX_INSTANCES == 0U
+#error "RCBUS_MAX_INSTANCES must be at least 1"
+#endif
 
 /** Таймаут "потери кадра" по умолчанию, мс - используется, если в конфигурации
  *  экземпляра failsafe_timeout_ms == 0. i-BUS шлёт кадры каждые ~7 мс, S.BUS -
@@ -143,6 +146,9 @@ extern "C" {
  *  кадров подряд, а не случайная задержка одного кадра. */
 #ifndef RCBUS_DEFAULT_FAILSAFE_TIMEOUT_MS
 #define RCBUS_DEFAULT_FAILSAFE_TIMEOUT_MS   100U
+#endif
+#if RCBUS_DEFAULT_FAILSAFE_TIMEOUT_MS == 0U
+#error "RCBUS_DEFAULT_FAILSAFE_TIMEOUT_MS must be non-zero - 0 would make RCBUS_IsFrameLost() always report loss"
 #endif
 
 /** Максимальное число каналов среди поддерживаемых протоколов (S.BUS - 16

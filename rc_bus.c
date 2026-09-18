@@ -2,11 +2,11 @@
  ******************************************************************************
  * @file    rc_bus.c
  * @brief   Реализация приёма i-BUS/S.BUS (см. rc_bus.h).
- * @author  Claude
- * @date    14.09.2026
- * @version 0.2
+ * @author  Mechanic
+ * @date    18.09.2026
+ * @version 0.3
  *
- * @copyright Copyright (c) 2026 Claude.
+ * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
  *            распространения - см. LICENSE / README.md в составе проекта.
  ******************************************************************************
@@ -45,7 +45,7 @@ static RCBUS_Handle_t s_pool[RCBUS_MAX_INSTANCES];
  *  первых len байт буфера. Общая для валидации входящих кадров и для
  *  формирования исходящих (телеметрия) - протокол использует одну и ту же
  *  формулу в обе стороны. */
-static uint16_t RCBUS_IBusChecksum16(const uint8_t *buf, uint16_t len)
+static uint16_t rcbus_ibus_checksum16(const uint8_t *buf, uint16_t len)
 {
     uint16_t sum = 0U;
     for (uint16_t i = 0U; i < len; i++)
@@ -61,7 +61,7 @@ static uint16_t RCBUS_IBusChecksum16(const uint8_t *buf, uint16_t len)
  *  телеметрии в одном из слотов. Сама телеметрия S.BUS2 не разбирается (см.
  *  "ЧЕГО ЗДЕСЬ НАРОЧНО НЕТ" в rc_bus.h) - здесь только чтобы не отбрасывать
  *  как битый валидный кадр КАНАЛОВ от такого приёмника. */
-static uint8_t RCBUS_IsKnownSBusEndByte(uint8_t end_byte)
+static uint8_t rcbus_is_known_sbus_end_byte(uint8_t end_byte)
 {
     return ((end_byte == 0x00U) || (end_byte == 0x04U) || (end_byte == 0x14U) ||
             (end_byte == 0x24U) || (end_byte == 0x34U)) ? 1U : 0U;
@@ -70,7 +70,7 @@ static uint8_t RCBUS_IsKnownSBusEndByte(uint8_t end_byte)
 /** Ищет свободный слот в пуле либо уже зарегистрированный по этому huart -
  *  для идемпотентности повторного RCBUS_Init(). NULL, если пул полон и
  *  совпадения не найдено. */
-static RCBUS_Handle_t *RCBUS_FindOrAllocSlot(UART_HandleTypeDef *huart)
+static RCBUS_Handle_t *rcbus_find_or_alloc_slot(UART_HandleTypeDef *huart)
 {
     uint32_t free_index = RCBUS_MAX_INSTANCES;
     uint32_t has_free = 0U;
@@ -102,7 +102,7 @@ static RCBUS_Handle_t *RCBUS_FindOrAllocSlot(UART_HandleTypeDef *huart)
  *  соответствуют требованиям выбранного протокола (см. таблицу в rc_bus.h).
  *  Ловит ошибку конфигурации CubeMX на этапе Init(), а не молчаливым потоком
  *  битых кадров в рантайме. */
-static uint8_t RCBUS_CheckUartSettings(const RCBUS_Config_t *config)
+static uint8_t rcbus_check_uart_settings(const RCBUS_Config_t *config)
 {
     const UART_InitTypeDef *init = &config->huart->Init;
 
@@ -127,7 +127,7 @@ static uint8_t RCBUS_CheckUartSettings(const RCBUS_Config_t *config)
 /** Заново запускает аппаратный приём следующего кадра (DMA + определение
  *  простоя линии). Общая для Init() (первый запуск) и обоих диспетчерских
  *  колбэков (перезапуск после кадра/ошибки). */
-static void RCBUS_RestartReception(RCBUS_Handle_t *h)
+static void rcbus_restart_reception(RCBUS_Handle_t *h)
 {
     (void)HAL_UARTEx_ReceiveToIdle_DMA(h->config.huart, h->rx_buffer, RCBUS_RX_BUFFER_LEN);
 
@@ -143,7 +143,7 @@ static void RCBUS_RestartReception(RCBUS_Handle_t *h)
  *  единую шкалу библиотеки - "как ширина импульса в мкс" (988..2012, центр
  *  1500), в которой уже и так находятся значения каналов i-BUS. Формула -
  *  стандартное для индустрии RC линейное преобразование S.BUS<->PWM. */
-static uint16_t RCBUS_SBusToUs(uint16_t raw11)
+static uint16_t rcbus_sbus_to_us(uint16_t raw11)
 {
     int32_t us = 1500 + (((int32_t)raw11 - 992) * 5) / 8;
     return (uint16_t)us;
@@ -152,7 +152,7 @@ static uint16_t RCBUS_SBusToUs(uint16_t raw11)
 /** Разбирает буфер как кадр i-BUS (данные каналов, команда 0x40): проверяет
  *  длину, заголовок и контрольную сумму (0xFFFF минус сумма всех байт кадра
  *  кроме самой контрольной суммы), при успехе заполняет channels[]. */
-static uint8_t RCBUS_ParseIBusFrame(RCBUS_Handle_t *h, const uint8_t *buf, uint16_t size)
+static uint8_t rcbus_parse_ibus_frame(RCBUS_Handle_t *h, const uint8_t *buf, uint16_t size)
 {
     if (size != RCBUS_IBUS_FRAME_LEN)
     {
@@ -164,7 +164,7 @@ static uint8_t RCBUS_ParseIBusFrame(RCBUS_Handle_t *h, const uint8_t *buf, uint1
     }
 
     uint16_t checksum_received = (uint16_t)((uint16_t)buf[30] | ((uint16_t)buf[31] << 8));
-    if (RCBUS_IBusChecksum16(buf, RCBUS_IBUS_FRAME_LEN - 2U) != checksum_received)
+    if (rcbus_ibus_checksum16(buf, RCBUS_IBUS_FRAME_LEN - 2U) != checksum_received)
     {
         return 0U; /* битый кадр - контрольная сумма не сошлась */
     }
@@ -193,13 +193,13 @@ static uint8_t RCBUS_ParseIBusFrame(RCBUS_Handle_t *h, const uint8_t *buf, uint1
  *  скользящее 24-битное окно из очередных 3 байт и вырезаем нужные 11 бит -
  *  окна перекрываются, поэтому один и тот же байт может войти в соседний
  *  канал, что и ожидаемо для плотной побитовой упаковки. */
-static uint8_t RCBUS_ParseSBusFrame(RCBUS_Handle_t *h, const uint8_t *buf, uint16_t size)
+static uint8_t rcbus_parse_sbus_frame(RCBUS_Handle_t *h, const uint8_t *buf, uint16_t size)
 {
     if (size != RCBUS_SBUS_FRAME_LEN)
     {
         return 0U;
     }
-    if ((buf[0] != RCBUS_SBUS_START_BYTE) || (RCBUS_IsKnownSBusEndByte(buf[24]) == 0U))
+    if ((buf[0] != RCBUS_SBUS_START_BYTE) || (rcbus_is_known_sbus_end_byte(buf[24]) == 0U))
     {
         return 0U;
     }
@@ -213,7 +213,7 @@ static uint8_t RCBUS_ParseSBusFrame(RCBUS_Handle_t *h, const uint8_t *buf, uint1
                          | ((uint32_t)buf[2U + byte_index] << 8)
                          | ((uint32_t)buf[3U + byte_index] << 16);
         uint16_t raw11 = (uint16_t)((window >> bit_offset) & 0x07FFU);
-        h->channels[ch] = RCBUS_SBusToUs(raw11);
+        h->channels[ch] = rcbus_sbus_to_us(raw11);
         bit_index += 11U;
     }
 
@@ -241,12 +241,12 @@ RCBUS_Handle_t *RCBUS_Init(const RCBUS_Config_t *config)
     {
         return NULL;
     }
-    if (RCBUS_CheckUartSettings(config) == 0U)
+    if (rcbus_check_uart_settings(config) == 0U)
     {
         return NULL; /* huart->Init не соответствует выбранному протоколу */
     }
 
-    RCBUS_Handle_t *h = RCBUS_FindOrAllocSlot(config->huart);
+    RCBUS_Handle_t *h = rcbus_find_or_alloc_slot(config->huart);
     if (h == NULL)
     {
         return NULL; /* пул исчерпан */
@@ -357,8 +357,8 @@ void RCBUS_UART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         }
 
         uint8_t ok = (h->config.protocol == RCBUS_PROTOCOL_IBUS)
-            ? RCBUS_ParseIBusFrame(h, h->rx_buffer, Size)
-            : RCBUS_ParseSBusFrame(h, h->rx_buffer, Size);
+            ? rcbus_parse_ibus_frame(h, h->rx_buffer, Size)
+            : rcbus_parse_sbus_frame(h, h->rx_buffer, Size);
 
         if (ok != 0U)
         {
@@ -370,7 +370,7 @@ void RCBUS_UART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             h->error_count++;
         }
 
-        RCBUS_RestartReception(h);
+        rcbus_restart_reception(h);
     }
 }
 
@@ -389,6 +389,6 @@ void RCBUS_UART_ErrorCallback(UART_HandleTypeDef *huart)
          * восстанавливает - обязательно останавливаем и перезапускаем, иначе
          * приём каналов "зависает" молча после первой же помехи на линии. */
         (void)HAL_UART_AbortReceive(huart);
-        RCBUS_RestartReception(h);
+        rcbus_restart_reception(h);
     }
 }
