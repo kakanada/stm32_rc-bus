@@ -7,11 +7,11 @@
  *          выступает в роли одного или нескольких виртуальных датчиков,
  *          которые приёмник опрашивает и передаёт значения на передатчик
  *          пульта для отображения пилоту.
- * @author  Claude
- * @date    14.09.2026
- * @version 0.2
+ * @author  Mechanic
+ * @date    18.09.2026
+ * @version 0.3
  *
- * @copyright Copyright (c) 2026 Claude.
+ * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
  *            распространения - см. LICENSE / README.md в составе проекта.
  *
@@ -117,6 +117,9 @@ extern "C" {
  *  физических half-duplex шин датчиков). */
 #ifndef RCBUS_TELEMETRY_MAX_INSTANCES
 #define RCBUS_TELEMETRY_MAX_INSTANCES   2U
+#endif
+#if RCBUS_TELEMETRY_MAX_INSTANCES == 0U
+#error "RCBUS_TELEMETRY_MAX_INSTANCES must be at least 1"
 #endif
 
 /** Диапазон адресов датчиков на шине i-BUS: так устроен протокол (адрес -

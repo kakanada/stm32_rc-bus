@@ -3,11 +3,11 @@
  * @file    rc_bus_telemetry.c
  * @brief   Реализация ответа телеметрией на шине датчиков i-BUS (см.
  *          rc_bus_telemetry.h).
- * @author  Claude
- * @date    14.09.2026
- * @version 0.2
+ * @author  Mechanic
+ * @date    18.09.2026
+ * @version 0.3
  *
- * @copyright Copyright (c) 2026 Claude.
+ * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
  *            распространения - см. LICENSE / README.md в составе проекта.
  ******************************************************************************
@@ -48,7 +48,7 @@ static RCBUS_TelemetryHandle_t s_telemetry_pool[RCBUS_TELEMETRY_MAX_INSTANCES];
  *  минус сумма первых len байт). Не выносится в общий заголовок ради
  *  независимости модулей друг от друга (каждый - самостоятельная пара
  *  .h/.c, которую можно использовать без второй половины библиотеки). */
-static uint16_t RCBUS_TelemetryChecksum16(const uint8_t *buf, uint16_t len)
+static uint16_t rcbus_telemetry_checksum16(const uint8_t *buf, uint16_t len)
 {
     uint16_t sum = 0U;
     for (uint16_t i = 0U; i < len; i++)
@@ -59,7 +59,7 @@ static uint16_t RCBUS_TelemetryChecksum16(const uint8_t *buf, uint16_t len)
 }
 
 /** Ищет свободный слот в пуле либо уже зарегистрированный по этому huart. */
-static RCBUS_TelemetryHandle_t *RCBUS_TelemetryFindOrAllocSlot(UART_HandleTypeDef *huart)
+static RCBUS_TelemetryHandle_t *rcbus_telemetry_find_or_alloc_slot(UART_HandleTypeDef *huart)
 {
     uint32_t free_index = RCBUS_TELEMETRY_MAX_INSTANCES;
     uint32_t has_free = 0U;
@@ -88,7 +88,7 @@ static RCBUS_TelemetryHandle_t *RCBUS_TelemetryFindOrAllocSlot(UART_HandleTypeDe
 }
 
 /** Заново запускает аппаратный приём следующего кадра опроса. */
-static void RCBUS_TelemetryRestartReception(RCBUS_TelemetryHandle_t *h)
+static void rcbus_telemetry_restart_reception(RCBUS_TelemetryHandle_t *h)
 {
     (void)HAL_UARTEx_ReceiveToIdle_DMA(h->config.huart, h->rx_buffer, RCBUS_TELEMETRY_RX_BUFFER_LEN);
     __HAL_DMA_DISABLE_IT(h->config.huart->hdmarx, DMA_IT_HT); /* см. пояснение в rc_bus.c */
@@ -101,7 +101,7 @@ static void RCBUS_TelemetryRestartReception(RCBUS_TelemetryHandle_t *h)
  *  вернутся по той же линии как "принятые" (самоэхо) и будут ошибочно
  *  разобраны как следующий кадр опроса. Приём возвращается в
  *  RCBUS_TelemetryUART_TxCpltCallback() после реального завершения передачи. */
-static void RCBUS_TelemetrySendResponse(RCBUS_TelemetryHandle_t *h, uint8_t cmd, uint8_t addr)
+static void rcbus_telemetry_send_response(RCBUS_TelemetryHandle_t *h, uint8_t cmd, uint8_t addr)
 {
     uint8_t len;
 
@@ -137,7 +137,7 @@ static void RCBUS_TelemetrySendResponse(RCBUS_TelemetryHandle_t *h, uint8_t cmd,
         len = (uint8_t)(4U + value_len);
     }
 
-    uint16_t checksum = RCBUS_TelemetryChecksum16(h->tx_buffer, (uint16_t)(len - 2U));
+    uint16_t checksum = rcbus_telemetry_checksum16(h->tx_buffer, (uint16_t)(len - 2U));
     h->tx_buffer[len - 2U] = (uint8_t)(checksum & 0xFFU);
     h->tx_buffer[len - 1U] = (uint8_t)(checksum >> 8);
 
@@ -149,7 +149,7 @@ static void RCBUS_TelemetrySendResponse(RCBUS_TelemetryHandle_t *h, uint8_t cmd,
 /** Проверяет, что huart->Init - 115200 8N1 (общие параметры линии i-BUS) И
  *  что huart реально настроен в режиме Half-Duplex (бит CR3.HDSEL) - т.е.
  *  в CubeMX/MX-коде был вызван HAL_HalfDuplex_Init(), а не HAL_UART_Init(). */
-static uint8_t RCBUS_TelemetryCheckUartSettings(const UART_HandleTypeDef *huart)
+static uint8_t rcbus_telemetry_check_uart_settings(const UART_HandleTypeDef *huart)
 {
     uint8_t line_ok = ((huart->Init.BaudRate == 115200U) &&
                         (huart->Init.WordLength == UART_WORDLENGTH_8B) &&
@@ -169,12 +169,12 @@ RCBUS_TelemetryHandle_t *RCBUS_TelemetryInit(const RCBUS_TelemetryConfig_t *conf
     {
         return NULL;
     }
-    if (RCBUS_TelemetryCheckUartSettings(config->huart) == 0U)
+    if (rcbus_telemetry_check_uart_settings(config->huart) == 0U)
     {
         return NULL; /* не 115200 8N1, либо huart не в режиме Half-Duplex */
     }
 
-    RCBUS_TelemetryHandle_t *h = RCBUS_TelemetryFindOrAllocSlot(config->huart);
+    RCBUS_TelemetryHandle_t *h = rcbus_telemetry_find_or_alloc_slot(config->huart);
     if (h == NULL)
     {
         return NULL; /* пул исчерпан */
@@ -269,7 +269,7 @@ void RCBUS_TelemetryUART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Siz
         if ((Size == RCBUS_IBUS_POLL_FRAME_LEN) && (h->rx_buffer[0] == RCBUS_IBUS_POLL_FRAME_LEN))
         {
             uint16_t checksum_received = (uint16_t)((uint16_t)h->rx_buffer[2] | ((uint16_t)h->rx_buffer[3] << 8));
-            if (RCBUS_TelemetryChecksum16(h->rx_buffer, 2U) == checksum_received)
+            if (rcbus_telemetry_checksum16(h->rx_buffer, 2U) == checksum_received)
             {
                 uint8_t addr = (uint8_t)(h->rx_buffer[1] & RCBUS_IBUS_ADDRESS_MASK);
                 uint8_t cmd  = (uint8_t)(h->rx_buffer[1] & RCBUS_IBUS_COMMAND_MASK);
@@ -281,7 +281,7 @@ void RCBUS_TelemetryUART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Siz
                     (h->sensors[addr].registered != 0U) && (cmd_known != 0U))
                 {
                     h->poll_count++;
-                    RCBUS_TelemetrySendResponse(h, cmd, addr);
+                    rcbus_telemetry_send_response(h, cmd, addr);
                     responding = 1U; /* приём перезапустит TxCpltCallback после ответа */
                 }
                 /* иначе - опрос чужого адреса или неизвестная команда: это
@@ -299,7 +299,7 @@ void RCBUS_TelemetryUART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Siz
 
         if (responding == 0U)
         {
-            RCBUS_TelemetryRestartReception(h);
+            rcbus_telemetry_restart_reception(h);
         }
     }
 }
@@ -316,7 +316,7 @@ void RCBUS_TelemetryUART_TxCpltCallback(UART_HandleTypeDef *huart)
 
         h->tx_pending = 0U;
         (void)HAL_HalfDuplex_EnableReceiver(huart);
-        RCBUS_TelemetryRestartReception(h);
+        rcbus_telemetry_restart_reception(h);
     }
 }
 
@@ -334,6 +334,6 @@ void RCBUS_TelemetryUART_ErrorCallback(UART_HandleTypeDef *huart)
         h->tx_pending = 0U;
         (void)HAL_UART_AbortReceive(huart);
         (void)HAL_HalfDuplex_EnableReceiver(huart); /* на случай, если ошибка застала посреди передачи ответа */
-        RCBUS_TelemetryRestartReception(h);
+        rcbus_telemetry_restart_reception(h);
     }
 }
