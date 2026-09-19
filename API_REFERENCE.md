@@ -269,3 +269,10 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   сверяясь с таблицей вашего приложения передатчика.
 - Требуется HAL с `HAL_UARTEx_ReceiveToIdle_DMA()`.
 - Инверсия сигнала S.BUS — только аппаратная (см. раздел про настройку UART).
+- Интеграция с **stm32_logger** — целиком опциональна и не тянется по
+  умолчанию. Определите `RC_BUS_LOGGER_ENABLED` до включения `rc_bus.h`/
+  `rc_bus_telemetry.h`, чтобы подключить `logger.h`/`logger_codes.h` и
+  отправлять в `LOGGER_Log()`/`LOGGER_Mark()` события ошибок инициализации,
+  ошибок UART и битых кадров (коды `LOG_CODE_RC_BUS_*`, адресное пространство
+  `LOG_ADDR_RC_BUS` согласовано с проектом stm32_logger). Без define — ни
+  одного упоминания `logger.h` в собранном коде.

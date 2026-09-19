@@ -3,8 +3,8 @@
  * @file    rc_bus.c
  * @brief   Реализация приёма i-BUS/S.BUS (см. rc_bus.h).
  * @author  Mechanic
- * @date    18.09.2026
- * @version 0.3
+ * @date    19.09.2026
+ * @version 0.4
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -29,6 +29,25 @@
 #define RCBUS_SBUS_FLAG_CH18         (1U << 1)
 #define RCBUS_SBUS_FLAG_FRAME_LOST   (1U << 2)
 #define RCBUS_SBUS_FLAG_FAILSAFE     (1U << 3)
+
+/* ------------------------------------------------------------------------ */
+/*  Обёртка над stm32_logger (см. RC_BUS_LOGGER_ENABLED в rc_bus.h)         */
+/* ------------------------------------------------------------------------ */
+/* Коды причин RCBUS_Init(): передаются как value в RC_BUS_INIT_FAIL, чтобы
+ * не заводить под них ещё код(ы) в logger_codes.h - там код события, здесь
+ * только различение причины ВНУТРИ одного события. */
+#define RCBUS_INIT_FAIL_BAD_CONFIG      1
+#define RCBUS_INIT_FAIL_UART_MISMATCH   2
+#define RCBUS_INIT_FAIL_POOL_EXHAUSTED  3
+#define RCBUS_INIT_FAIL_RX_START        4
+
+#ifdef RC_BUS_LOGGER_ENABLED
+#define RCBUS_LOG(code, source, value)  LOGGER_Log((code), (uint16_t)(source), (int32_t)(value))
+#define RCBUS_LOG_MARK(code)            LOGGER_Mark((code))
+#else
+#define RCBUS_LOG(code, source, value)  ((void)0)
+#define RCBUS_LOG_MARK(code)            ((void)0)
+#endif
 
 /* ------------------------------------------------------------------------ */
 /*  Статический пул хэндлов (без malloc)                                    */
@@ -235,20 +254,24 @@ RCBUS_Handle_t *RCBUS_Init(const RCBUS_Config_t *config)
 {
     if ((config == NULL) || (config->huart == NULL))
     {
+        RCBUS_LOG(LOG_CODE_RC_BUS_INIT_FAIL, 0, RCBUS_INIT_FAIL_BAD_CONFIG);
         return NULL;
     }
     if ((config->protocol != RCBUS_PROTOCOL_IBUS) && (config->protocol != RCBUS_PROTOCOL_SBUS))
     {
+        RCBUS_LOG(LOG_CODE_RC_BUS_INIT_FAIL, 0, RCBUS_INIT_FAIL_BAD_CONFIG);
         return NULL;
     }
     if (rcbus_check_uart_settings(config) == 0U)
     {
+        RCBUS_LOG(LOG_CODE_RC_BUS_INIT_FAIL, 0, RCBUS_INIT_FAIL_UART_MISMATCH);
         return NULL; /* huart->Init не соответствует выбранному протоколу */
     }
 
     RCBUS_Handle_t *h = rcbus_find_or_alloc_slot(config->huart);
     if (h == NULL)
     {
+        RCBUS_LOG(LOG_CODE_RC_BUS_INIT_FAIL, 0, RCBUS_INIT_FAIL_POOL_EXHAUSTED);
         return NULL; /* пул исчерпан */
     }
 
@@ -282,6 +305,7 @@ RCBUS_Handle_t *RCBUS_Init(const RCBUS_Config_t *config)
     if ((rx_status != HAL_OK) && (rx_status != HAL_BUSY))
     {
         h->used = 0U; /* откатываем выделение слота - приём не запустился */
+        RCBUS_LOG(LOG_CODE_RC_BUS_INIT_FAIL, 0, RCBUS_INIT_FAIL_RX_START);
         return NULL;
     }
     __HAL_DMA_DISABLE_IT(config->huart->hdmarx, DMA_IT_HT);
@@ -368,6 +392,7 @@ void RCBUS_UART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         else
         {
             h->error_count++;
+            RCBUS_LOG_MARK(LOG_CODE_RC_BUS_FRAME_ERROR);
         }
 
         rcbus_restart_reception(h);
@@ -385,6 +410,7 @@ void RCBUS_UART_ErrorCallback(UART_HandleTypeDef *huart)
         }
 
         h->error_count++;
+        RCBUS_LOG(LOG_CODE_RC_BUS_UART_ERROR, h->index, h->error_count);
         /* DMA-приём после ошибки USART (overrun/framing/noise) сам себя не
          * восстанавливает - обязательно останавливаем и перезапускаем, иначе
          * приём каналов "зависает" молча после первой же помехи на линии. */

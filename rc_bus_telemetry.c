@@ -4,8 +4,8 @@
  * @brief   Реализация ответа телеметрией на шине датчиков i-BUS (см.
  *          rc_bus_telemetry.h).
  * @author  Mechanic
- * @date    18.09.2026
- * @version 0.3
+ * @date    19.09.2026
+ * @version 0.4
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -32,6 +32,22 @@
  * режим включается отдельным вызовом HAL_HalfDuplex_Init() в MX-коде. */
 #ifndef USART_CR3_HDSEL
 #define USART_CR3_HDSEL 0x00000008U
+#endif
+
+/* ------------------------------------------------------------------------ */
+/*  Обёртка над stm32_logger (см. RC_BUS_LOGGER_ENABLED в rc_bus.h)         */
+/* ------------------------------------------------------------------------ */
+#define RCBUS_TELEMETRY_INIT_FAIL_BAD_CONFIG      1
+#define RCBUS_TELEMETRY_INIT_FAIL_UART_MISMATCH   2
+#define RCBUS_TELEMETRY_INIT_FAIL_POOL_EXHAUSTED  3
+#define RCBUS_TELEMETRY_INIT_FAIL_RX_START        4
+
+#ifdef RC_BUS_LOGGER_ENABLED
+#define RCBUS_LOG(code, source, value)  LOGGER_Log((code), (uint16_t)(source), (int32_t)(value))
+#define RCBUS_LOG_MARK(code)            LOGGER_Mark((code))
+#else
+#define RCBUS_LOG(code, source, value)  ((void)0)
+#define RCBUS_LOG_MARK(code)            ((void)0)
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -167,16 +183,19 @@ RCBUS_TelemetryHandle_t *RCBUS_TelemetryInit(const RCBUS_TelemetryConfig_t *conf
 {
     if ((config == NULL) || (config->huart == NULL))
     {
+        RCBUS_LOG(LOG_CODE_RC_BUS_TELEMETRY_INIT_FAIL, 0, RCBUS_TELEMETRY_INIT_FAIL_BAD_CONFIG);
         return NULL;
     }
     if (rcbus_telemetry_check_uart_settings(config->huart) == 0U)
     {
+        RCBUS_LOG(LOG_CODE_RC_BUS_TELEMETRY_INIT_FAIL, 0, RCBUS_TELEMETRY_INIT_FAIL_UART_MISMATCH);
         return NULL; /* не 115200 8N1, либо huart не в режиме Half-Duplex */
     }
 
     RCBUS_TelemetryHandle_t *h = rcbus_telemetry_find_or_alloc_slot(config->huart);
     if (h == NULL)
     {
+        RCBUS_LOG(LOG_CODE_RC_BUS_TELEMETRY_INIT_FAIL, 0, RCBUS_TELEMETRY_INIT_FAIL_POOL_EXHAUSTED);
         return NULL; /* пул исчерпан */
     }
 
@@ -199,6 +218,7 @@ RCBUS_TelemetryHandle_t *RCBUS_TelemetryInit(const RCBUS_TelemetryConfig_t *conf
     if ((rx_status != HAL_OK) && (rx_status != HAL_BUSY))
     {
         h->used = 0U;
+        RCBUS_LOG(LOG_CODE_RC_BUS_TELEMETRY_INIT_FAIL, 0, RCBUS_TELEMETRY_INIT_FAIL_RX_START);
         return NULL;
     }
     __HAL_DMA_DISABLE_IT(config->huart->hdmarx, DMA_IT_HT);
@@ -290,11 +310,13 @@ void RCBUS_TelemetryUART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Siz
             else
             {
                 h->error_count++; /* контрольная сумма не сошлась - битый кадр опроса */
+                RCBUS_LOG_MARK(LOG_CODE_RC_BUS_TELEMETRY_FRAME_ERROR);
             }
         }
         else
         {
             h->error_count++; /* неожиданная длина кадра */
+            RCBUS_LOG_MARK(LOG_CODE_RC_BUS_TELEMETRY_FRAME_ERROR);
         }
 
         if (responding == 0U)
@@ -331,6 +353,7 @@ void RCBUS_TelemetryUART_ErrorCallback(UART_HandleTypeDef *huart)
         }
 
         h->error_count++;
+        RCBUS_LOG(LOG_CODE_RC_BUS_TELEMETRY_UART_ERROR, h->index, h->error_count);
         h->tx_pending = 0U;
         (void)HAL_UART_AbortReceive(huart);
         (void)HAL_HalfDuplex_EnableReceiver(huart); /* на случай, если ошибка застала посреди передачи ответа */
