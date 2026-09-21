@@ -60,10 +60,12 @@ static RCBUS_TelemetryHandle_t s_telemetry_pool[RCBUS_TELEMETRY_MAX_INSTANCES];
 /*  Внутренние вспомогательные функции                                      */
 /* ------------------------------------------------------------------------ */
 
-/** Контрольная сумма кадров i-BUS - идентична формуле в rc_bus.c (0xFFFF
- *  минус сумма первых len байт). Не выносится в общий заголовок ради
- *  независимости модулей друг от друга (каждый - самостоятельная пара
- *  .h/.c, которую можно использовать без второй половины библиотеки). */
+/**
+ * @brief   Контрольная сумма кадров i-BUS (0xFFFF минус сумма байт).
+ * @param   buf  буфер кадра
+ * @param   len  число байт, участвующих в сумме
+ * @return  16-битная контрольная сумма
+ */
 static uint16_t rcbus_telemetry_checksum16(const uint8_t *buf, uint16_t len)
 {
     uint16_t sum = 0U;
@@ -74,7 +76,11 @@ static uint16_t rcbus_telemetry_checksum16(const uint8_t *buf, uint16_t len)
     return (uint16_t)(0xFFFFU - sum);
 }
 
-/** Ищет свободный слот в пуле либо уже зарегистрированный по этому huart. */
+/**
+ * @brief   Ищет свободный слот в пуле либо уже зарегистрированный по huart.
+ * @param   huart  UART, для которого ищется слот
+ * @return  указатель на слот; NULL, если пул полон и совпадения нет
+ */
 static RCBUS_TelemetryHandle_t *rcbus_telemetry_find_or_alloc_slot(UART_HandleTypeDef *huart)
 {
     uint32_t free_index = RCBUS_TELEMETRY_MAX_INSTANCES;
@@ -103,20 +109,22 @@ static RCBUS_TelemetryHandle_t *rcbus_telemetry_find_or_alloc_slot(UART_HandleTy
     return &s_telemetry_pool[free_index];
 }
 
-/** Заново запускает аппаратный приём следующего кадра опроса. */
+/**
+ * @brief  Заново запускает аппаратный приём следующего кадра опроса.
+ * @param  h  хэндл экземпляра
+ */
 static void rcbus_telemetry_restart_reception(RCBUS_TelemetryHandle_t *h)
 {
     (void)HAL_UARTEx_ReceiveToIdle_DMA(h->config.huart, h->rx_buffer, RCBUS_TELEMETRY_RX_BUFFER_LEN);
     __HAL_DMA_DISABLE_IT(h->config.huart->hdmarx, DMA_IT_HT); /* см. пояснение в rc_bus.c */
 }
 
-/** Формирует и отправляет ответ на опрос по адресу addr командой cmd (уже
- *  проверено вызывающим кодом, что sensors[addr] зарегистрирован). Линия
- *  однопроводная - на время передачи аппаратно отключаем приём
- *  (HAL_HalfDuplex_EnableTransmitter), иначе собственные переданные байты
- *  вернутся по той же линии как "принятые" (самоэхо) и будут ошибочно
- *  разобраны как следующий кадр опроса. Приём возвращается в
- *  RCBUS_TelemetryUART_TxCpltCallback() после реального завершения передачи. */
+/**
+ * @brief  Формирует и отправляет ответ на опрос по адресу addr командой cmd.
+ * @param  h     хэндл экземпляра
+ * @param  cmd   код команды опроса (DISCOVER/TYPE/MEASUREMENT)
+ * @param  addr  адрес датчика (уже проверено, что зарегистрирован)
+ */
 static void rcbus_telemetry_send_response(RCBUS_TelemetryHandle_t *h, uint8_t cmd, uint8_t addr)
 {
     uint8_t len;
@@ -162,9 +170,11 @@ static void rcbus_telemetry_send_response(RCBUS_TelemetryHandle_t *h, uint8_t cm
     (void)HAL_UART_Transmit_IT(h->config.huart, h->tx_buffer, len);
 }
 
-/** Проверяет, что huart->Init - 115200 8N1 (общие параметры линии i-BUS) И
- *  что huart реально настроен в режиме Half-Duplex (бит CR3.HDSEL) - т.е.
- *  в CubeMX/MX-коде был вызван HAL_HalfDuplex_Init(), а не HAL_UART_Init(). */
+/**
+ * @brief   Проверяет, что huart - 115200 8N1 и настроен в режиме Half-Duplex.
+ * @param   huart  проверяемый UART
+ * @return  1, если настройки корректны; иначе 0
+ */
 static uint8_t rcbus_telemetry_check_uart_settings(const UART_HandleTypeDef *huart)
 {
     uint8_t line_ok = ((huart->Init.BaudRate == 115200U) &&
