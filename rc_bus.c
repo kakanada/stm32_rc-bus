@@ -4,7 +4,7 @@
  * @brief   Реализация приёма i-BUS/S.BUS/CRSF (см. rc_bus.h).
  * @author  Mechanic
  * @date    23.09.2026
- * @version 0.7
+ * @version 0.8
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
