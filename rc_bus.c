@@ -4,7 +4,7 @@
  * @brief   Реализация приёма i-BUS/S.BUS/CRSF (см. rc_bus.h).
  * @author  Mechanic
  * @date    23.09.2026
- * @version 0.5
+ * @version 0.6
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -143,9 +143,15 @@ static uint8_t rcbus_check_uart_settings(const RCBUS_Config_t *config)
 
     if (config->protocol == RCBUS_PROTOCOL_CRSF)
     {
-        /* CRSF - обычный прямой (неинвертированный) UART, как i-BUS, только
-         * на другой скорости - именно поэтому CRSF снимает необходимость во
-         * внешнем инверторе, обязательном для S.BUS на STM32F4. */
+        /* CRSF - прямой (неинвертированный) сигнал, как i-BUS, только на
+         * другой скорости. Приёмники встречаются и с раздельными RX/TX
+         * (обычный асинхронный UART), и с одним общим проводом (аппаратный
+         * Half-Duplex) - модуль только принимает, поэтому ему без разницы,
+         * какой из двух режимов настроен в CubeMX (HAL_UART_Init() или
+         * HAL_HalfDuplex_Init()): в обоих приём через
+         * HAL_UARTEx_ReceiveToIdle_DMA() работает одинаково, различается
+         * только сама разводка линии. Поэтому здесь проверяются только
+         * параметры линии, а не то, включён ли CR3.HDSEL. */
         return ((init->BaudRate == 420000U) &&
                 (init->WordLength == UART_WORDLENGTH_8B) &&
                 (init->Parity == UART_PARITY_NONE) &&
