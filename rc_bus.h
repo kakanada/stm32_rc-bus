@@ -6,7 +6,7 @@
  *          rc_bus_telemetry.h.
  * @author  Mechanic
  * @date    23.09.2026
- * @version 0.6
+ * @version 0.7
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия

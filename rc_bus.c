@@ -4,7 +4,7 @@
  * @brief   Реализация приёма i-BUS/S.BUS/CRSF (см. rc_bus.h).
  * @author  Mechanic
  * @date    23.09.2026
- * @version 0.6
+ * @version 0.7
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -33,6 +33,14 @@
 #define RCBUS_CRSF_SYNC_BYTE            0xC8U  /* байт0: адрес назначения "Flight Controller" */
 #define RCBUS_CRSF_FRAMETYPE_CHANNELS   0x16U  /* байт2: тип кадра RC_CHANNELS_PACKED */
 #define RCBUS_CRSF_CHANNELS_PAYLOAD_LEN 22U    /* 16 каналов x 11 бит = 22 байта данных */
+
+/* Бит регистра CR3, включающий аппаратный режим Half-Duplex (Single Wire) -
+ * стандартное имя из CMSIS-заголовков STM32 (одинаково для F4/H7). См.
+ * rcbus_ensure_half_duplex_receiver() - в UART_InitTypeDef нет отдельного
+ * поля "half-duplex", поэтому проверяем регистр напрямую. */
+#ifndef USART_CR3_HDSEL
+#define USART_CR3_HDSEL 0x00000008U
+#endif
 
 /* ------------------------------------------------------------------------ */
 /*  Обёртка над stm32_logger (см. RC_BUS_LOGGER_ENABLED в rc_bus.h)         */
@@ -169,11 +177,30 @@ static uint8_t rcbus_check_uart_settings(const RCBUS_Config_t *config)
 }
 
 /**
+ * @brief   На линии в режиме Half-Duplex принудительно фиксирует направление
+ *          "только приём" (TE=0/RE=1), чтобы собственный передатчик МК не
+ *          держал общий провод в состоянии "mark" (push-pull) и не забивал
+ *          сигнал от приёмника - модуль никогда не передаёт, поэтому TX ему
+ *          не нужен в принципе. На обычной асинхронной линии (раздельные
+ *          RX/TX) не действует - там TX и RX физически разные пины, TE ни
+ *          на что не влияет.
+ * @param   huart  UART экземпляра
+ */
+static void rcbus_ensure_half_duplex_receiver(UART_HandleTypeDef *huart)
+{
+    if ((huart->Instance->CR3 & USART_CR3_HDSEL) != 0U)
+    {
+        (void)HAL_HalfDuplex_EnableReceiver(huart);
+    }
+}
+
+/**
  * @brief  Заново запускает аппаратный приём следующего кадра (DMA + IDLE).
  * @param  h  хэндл экземпляра
  */
 static void rcbus_restart_reception(RCBUS_Handle_t *h)
 {
+    rcbus_ensure_half_duplex_receiver(h->config.huart);
     (void)HAL_UARTEx_ReceiveToIdle_DMA(h->config.huart, h->rx_buffer, RCBUS_RX_BUFFER_LEN);
 
     /* HAL_UARTEx_ReceiveToIdle_DMA включает прерывание "половина буфера
@@ -424,6 +451,7 @@ RCBUS_Handle_t *RCBUS_Init(const RCBUS_Config_t *config)
     h->last_frame_tick = HAL_GetTick();
     h->used = 1U;
 
+    rcbus_ensure_half_duplex_receiver(config->huart);
     HAL_StatusTypeDef rx_status = HAL_UARTEx_ReceiveToIdle_DMA(config->huart, h->rx_buffer, RCBUS_RX_BUFFER_LEN);
     if ((rx_status != HAL_OK) && (rx_status != HAL_BUSY))
     {
