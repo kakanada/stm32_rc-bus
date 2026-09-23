@@ -1,10 +1,10 @@
 /**
  ******************************************************************************
  * @file    rc_bus.c
- * @brief   Реализация приёма i-BUS/S.BUS (см. rc_bus.h).
+ * @brief   Реализация приёма i-BUS/S.BUS/CRSF (см. rc_bus.h).
  * @author  Mechanic
- * @date    19.09.2026
- * @version 0.4
+ * @date    23.09.2026
+ * @version 0.5
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -29,6 +29,10 @@
 #define RCBUS_SBUS_FLAG_CH18         (1U << 1)
 #define RCBUS_SBUS_FLAG_FRAME_LOST   (1U << 2)
 #define RCBUS_SBUS_FLAG_FAILSAFE     (1U << 3)
+
+#define RCBUS_CRSF_SYNC_BYTE            0xC8U  /* байт0: адрес назначения "Flight Controller" */
+#define RCBUS_CRSF_FRAMETYPE_CHANNELS   0x16U  /* байт2: тип кадра RC_CHANNELS_PACKED */
+#define RCBUS_CRSF_CHANNELS_PAYLOAD_LEN 22U    /* 16 каналов x 11 бит = 22 байта данных */
 
 /* ------------------------------------------------------------------------ */
 /*  Обёртка над stm32_logger (см. RC_BUS_LOGGER_ENABLED в rc_bus.h)         */
@@ -137,6 +141,17 @@ static uint8_t rcbus_check_uart_settings(const RCBUS_Config_t *config)
                 (init->StopBits == UART_STOPBITS_1)) ? 1U : 0U;
     }
 
+    if (config->protocol == RCBUS_PROTOCOL_CRSF)
+    {
+        /* CRSF - обычный прямой (неинвертированный) UART, как i-BUS, только
+         * на другой скорости - именно поэтому CRSF снимает необходимость во
+         * внешнем инверторе, обязательном для S.BUS на STM32F4. */
+        return ((init->BaudRate == 420000U) &&
+                (init->WordLength == UART_WORDLENGTH_8B) &&
+                (init->Parity == UART_PARITY_NONE) &&
+                (init->StopBits == UART_STOPBITS_1)) ? 1U : 0U;
+    }
+
     /* S.BUS: 8 бит данных + чётный бит чётности = 9 бит слова на аппаратном
      * уровне STM32 USART (стандартная особенность HAL - чётность занимает
      * старший бит посылки, поэтому при включённой чётности WordLength всегда
@@ -164,14 +179,35 @@ static void rcbus_restart_reception(RCBUS_Handle_t *h)
 }
 
 /**
- * @brief   Переводит сырое 11-битное значение канала S.BUS в шкалу "мкс".
+ * @brief   Переводит сырое 11-битное значение канала (S.BUS либо CRSF - у
+ *          обоих протоколов один и тот же диапазон и центр) в шкалу "мкс".
  * @param   raw11  сырое значение канала (0..2047, центр 992)
  * @return  значение в единой шкале библиотеки (988..2012, центр 1500)
  */
-static uint16_t rcbus_sbus_to_us(uint16_t raw11)
+static uint16_t rcbus_raw11_to_us(uint16_t raw11)
 {
     int32_t us = 1500 + (((int32_t)raw11 - 992) * 5) / 8;
     return (uint16_t)us;
+}
+
+/**
+ * @brief   Контрольная сумма CRSF (CRC-8, полином 0xD5 "DVB-S2", без таблицы).
+ * @param   buf  буфер (тип кадра + полезная нагрузка, без адреса/длины/CRC)
+ * @param   len  число байт, участвующих в сумме
+ * @return  8-битная контрольная сумма
+ */
+static uint8_t rcbus_crsf_crc8(const uint8_t *buf, uint16_t len)
+{
+    uint8_t crc = 0U;
+    for (uint16_t i = 0U; i < len; i++)
+    {
+        crc ^= buf[i];
+        for (uint8_t bit = 0U; bit < 8U; bit++)
+        {
+            crc = ((crc & 0x80U) != 0U) ? (uint8_t)((uint8_t)(crc << 1) ^ 0xD5U) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
 }
 
 /**
@@ -243,7 +279,7 @@ static uint8_t rcbus_parse_sbus_frame(RCBUS_Handle_t *h, const uint8_t *buf, uin
                          | ((uint32_t)buf[2U + byte_index] << 8)
                          | ((uint32_t)buf[3U + byte_index] << 16);
         uint16_t raw11 = (uint16_t)((window >> bit_offset) & 0x07FFU);
-        h->channels[ch] = rcbus_sbus_to_us(raw11);
+        h->channels[ch] = rcbus_raw11_to_us(raw11);
         bit_index += 11U;
     }
 
@@ -254,6 +290,66 @@ static uint8_t rcbus_parse_sbus_frame(RCBUS_Handle_t *h, const uint8_t *buf, uin
     h->sbus_frame_lost_flag   = ((flags & RCBUS_SBUS_FLAG_FRAME_LOST) != 0U) ? 1U : 0U;
     h->sbus_failsafe_flag     = ((flags & RCBUS_SBUS_FLAG_FAILSAFE) != 0U) ? 1U : 0U;
     h->sbus2_telemetry_signal = (buf[24] != RCBUS_SBUS_END_BYTE_CLASSIC) ? 1U : 0U;
+    return 1U;
+}
+
+/**
+ * @brief   Разбирает буфер как кадр CRSF, при успехе (только для кадра
+ *          RC_CHANNELS_PACKED) заполняет h. Приёмник CRSF шлёт на той же
+ *          линии и другие типы кадров (например, LINK_STATISTICS) - они
+ *          не являются ошибкой линии, но и не кадр каналов.
+ * @param   h     хэндл экземпляра
+ * @param   buf   буфер принятого кадра
+ * @param   size  число принятых байт
+ * @return  1, если это валидный кадр каналов (channels обновлены); 2, если
+ *          это валидный кадр CRSF другого типа (не ошибка, но не каналы);
+ *          0, если кадр битый/не распознан
+ */
+static uint8_t rcbus_parse_crsf_frame(RCBUS_Handle_t *h, const uint8_t *buf, uint16_t size)
+{
+    if ((size < 4U) || (buf[0] != RCBUS_CRSF_SYNC_BYTE))
+    {
+        return 0U;
+    }
+
+    uint16_t frame_len = buf[1]; /* тип + данные + CRC, без адреса и самой длины */
+    if ((frame_len < 2U) || ((uint16_t)(frame_len + 2U) != size))
+    {
+        return 0U; /* заявленная длина не совпадает с реально принятой */
+    }
+
+    uint8_t crc_received = buf[size - 1U];
+    if (rcbus_crsf_crc8(&buf[2], (uint16_t)(frame_len - 1U)) != crc_received)
+    {
+        return 0U; /* битый кадр - контрольная сумма не сошлась */
+    }
+
+    if ((buf[2] != RCBUS_CRSF_FRAMETYPE_CHANNELS) ||
+        (frame_len != (RCBUS_CRSF_CHANNELS_PAYLOAD_LEN + 2U)))
+    {
+        return 2U; /* валидный кадр CRSF другого типа - не ошибка, но не каналы */
+    }
+
+    const uint8_t *payload = &buf[3];
+    uint32_t bit_index = 0U;
+    for (uint8_t ch = 0U; ch < RCBUS_CRSF_CHANNEL_COUNT; ch++)
+    {
+        uint32_t byte_index = bit_index / 8U;
+        uint32_t bit_offset = bit_index % 8U;
+        uint32_t window = (uint32_t)payload[byte_index]
+                         | ((uint32_t)payload[byte_index + 1U] << 8)
+                         | ((uint32_t)payload[byte_index + 2U] << 16);
+        uint16_t raw11 = (uint16_t)((window >> bit_offset) & 0x07FFU);
+        h->channels[ch] = rcbus_raw11_to_us(raw11);
+        bit_index += 11U;
+    }
+
+    h->channel_count          = RCBUS_CRSF_CHANNEL_COUNT;
+    h->digital_ch17           = 0U; /* у CRSF нет отдельных дискретных каналов 17/18 */
+    h->digital_ch18           = 0U;
+    h->sbus2_telemetry_signal = 0U; /* поле относится только к S.BUS2 */
+    h->sbus_frame_lost_flag   = 0U; /* явного флага в кадре каналов CRSF нет */
+    h->sbus_failsafe_flag     = 0U;
     return 1U;
 }
 
@@ -268,7 +364,8 @@ RCBUS_Handle_t *RCBUS_Init(const RCBUS_Config_t *config)
         RCBUS_LOG(LOG_CODE_RC_BUS_INIT_FAIL, 0, RCBUS_INIT_FAIL_BAD_CONFIG);
         return NULL;
     }
-    if ((config->protocol != RCBUS_PROTOCOL_IBUS) && (config->protocol != RCBUS_PROTOCOL_SBUS))
+    if ((config->protocol != RCBUS_PROTOCOL_IBUS) && (config->protocol != RCBUS_PROTOCOL_SBUS) &&
+        (config->protocol != RCBUS_PROTOCOL_CRSF))
     {
         RCBUS_LOG(LOG_CODE_RC_BUS_INIT_FAIL, 0, RCBUS_INIT_FAIL_BAD_CONFIG);
         return NULL;
@@ -296,9 +393,18 @@ RCBUS_Handle_t *RCBUS_Init(const RCBUS_Config_t *config)
     {
         h->channels[ch] = 0U;
     }
-    h->channel_count = (config->protocol == RCBUS_PROTOCOL_IBUS)
-        ? RCBUS_IBUS_CHANNEL_COUNT
-        : RCBUS_SBUS_CHANNEL_COUNT;
+    if (config->protocol == RCBUS_PROTOCOL_IBUS)
+    {
+        h->channel_count = RCBUS_IBUS_CHANNEL_COUNT;
+    }
+    else if (config->protocol == RCBUS_PROTOCOL_CRSF)
+    {
+        h->channel_count = RCBUS_CRSF_CHANNEL_COUNT;
+    }
+    else
+    {
+        h->channel_count = RCBUS_SBUS_CHANNEL_COUNT;
+    }
     h->digital_ch17           = 0U;
     h->digital_ch18           = 0U;
     h->sbus2_telemetry_signal = 0U;
@@ -391,20 +497,33 @@ void RCBUS_UART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             continue; /* не наш экземпляр/слот пуст - фильтрация по полю хэндла */
         }
 
-        uint8_t ok = (h->config.protocol == RCBUS_PROTOCOL_IBUS)
-            ? rcbus_parse_ibus_frame(h, h->rx_buffer, Size)
-            : rcbus_parse_sbus_frame(h, h->rx_buffer, Size);
+        uint8_t result;
+        if (h->config.protocol == RCBUS_PROTOCOL_IBUS)
+        {
+            result = rcbus_parse_ibus_frame(h, h->rx_buffer, Size);
+        }
+        else if (h->config.protocol == RCBUS_PROTOCOL_CRSF)
+        {
+            result = rcbus_parse_crsf_frame(h, h->rx_buffer, Size);
+        }
+        else
+        {
+            result = rcbus_parse_sbus_frame(h, h->rx_buffer, Size);
+        }
 
-        if (ok != 0U)
+        if (result == 1U)
         {
             h->frame_count++;
             h->last_frame_tick = HAL_GetTick();
         }
-        else
+        else if (result == 0U)
         {
             h->error_count++;
             RCBUS_LOG_MARK(LOG_CODE_RC_BUS_FRAME_ERROR);
         }
+        /* result == 2U (только CRSF) - валидный кадр другого типа, не кадр
+         * каналов: не ошибка линии, но и не повод обновлять frame_count/
+         * last_frame_tick (см. rcbus_parse_crsf_frame). */
 
         rcbus_restart_reception(h);
     }
