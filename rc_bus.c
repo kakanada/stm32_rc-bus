@@ -1,10 +1,11 @@
 /**
  ******************************************************************************
  * @file    rc_bus.c
- * @brief   Реализация приёма i-BUS/S.BUS/CRSF (см. rc_bus.h).
+ * @brief   Реализация приёма i-BUS/S.BUS/CRSF и исходящей телеметрии CRSF
+ *          (см. rc_bus.h).
  * @author  Mechanic
- * @date    23.09.2026
- * @version 0.8
+ * @date    30.09.2026
+ * @version 0.9
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -33,6 +34,9 @@
 #define RCBUS_CRSF_SYNC_BYTE            0xC8U  /* байт0: адрес назначения "Flight Controller" */
 #define RCBUS_CRSF_FRAMETYPE_CHANNELS   0x16U  /* байт2: тип кадра RC_CHANNELS_PACKED */
 #define RCBUS_CRSF_CHANNELS_PAYLOAD_LEN 22U    /* 16 каналов x 11 бит = 22 байта данных */
+
+#define RCBUS_CRSF_FRAMETYPE_BATTERY    0x08U  /* тип исходящего кадра "датчик батареи" */
+#define RCBUS_CRSF_BATTERY_PAYLOAD_LEN  8U     /* напряжение(2)+ток(2)+ёмкость(3)+остаток(1) */
 
 /* Бит регистра CR3, включающий аппаратный режим Half-Duplex (Single Wire) -
  * стандартное имя из CMSIS-заголовков STM32 (одинаково для F4/H7). См.
@@ -177,18 +181,29 @@ static uint8_t rcbus_check_uart_settings(const RCBUS_Config_t *config)
 }
 
 /**
+ * @brief   Проверяет, включён ли на линии аппаратный режим Half-Duplex.
+ * @param   huart  UART экземпляра
+ * @return  1, если линия Half-Duplex (Single Wire); 0, если обычная
+ *          асинхронная (раздельные RX/TX)
+ */
+static uint8_t rcbus_is_half_duplex(const UART_HandleTypeDef *huart)
+{
+    return ((huart->Instance->CR3 & USART_CR3_HDSEL) != 0U) ? 1U : 0U;
+}
+
+/**
  * @brief   На линии в режиме Half-Duplex принудительно фиксирует направление
  *          "только приём" (TE=0/RE=1), чтобы собственный передатчик МК не
  *          держал общий провод в состоянии "mark" (push-pull) и не забивал
- *          сигнал от приёмника - модуль никогда не передаёт, поэтому TX ему
- *          не нужен в принципе. На обычной асинхронной линии (раздельные
- *          RX/TX) не действует - там TX и RX физически разные пины, TE ни
- *          на что не влияет.
+ *          сигнал от приёмника - вне отправки телеметрии (см.
+ *          RCBUS_CRSF_SendBatteryTelemetry()) модуль только принимает. На
+ *          обычной асинхронной линии (раздельные RX/TX) не действует - там
+ *          TX и RX физически разные пины, TE ни на что не влияет.
  * @param   huart  UART экземпляра
  */
 static void rcbus_ensure_half_duplex_receiver(UART_HandleTypeDef *huart)
 {
-    if ((huart->Instance->CR3 & USART_CR3_HDSEL) != 0U)
+    if (rcbus_is_half_duplex(huart) != 0U)
     {
         (void)HAL_HalfDuplex_EnableReceiver(huart);
     }
@@ -443,6 +458,7 @@ RCBUS_Handle_t *RCBUS_Init(const RCBUS_Config_t *config)
     h->sbus2_telemetry_signal = 0U;
     h->sbus_frame_lost_flag   = 0U;
     h->sbus_failsafe_flag     = 0U;
+    h->tx_pending             = 0U;
     h->frame_count            = 0U;
     h->error_count            = 0U;
     /* Пока не пришёл первый кадр, таймаут потери связи отсчитывается с
@@ -518,6 +534,60 @@ uint8_t RCBUS_IsFailsafe(const RCBUS_Handle_t *h)
 }
 
 /* ------------------------------------------------------------------------ */
+/*  Исходящая телеметрия CRSF                                               */
+/* ------------------------------------------------------------------------ */
+
+HAL_StatusTypeDef RCBUS_CRSF_SendBatteryTelemetry(RCBUS_Handle_t *h,
+                                                   uint16_t voltage_mv,
+                                                   uint16_t current_ma,
+                                                   uint32_t capacity_mah,
+                                                   uint8_t remaining_pct)
+{
+    if ((h == NULL) || (h->config.protocol != RCBUS_PROTOCOL_CRSF))
+    {
+        return HAL_ERROR;
+    }
+    if (h->tx_pending != 0U)
+    {
+        return HAL_ERROR; /* предыдущая отправка телеметрии ещё не завершена */
+    }
+
+    /* Поля кадра CRSF "датчик батареи" - big-endian, напряжение/ток в
+     * единицах 0.1 В / 0.1 А (децивольты/дециамперы), ёмкость 24 бита. */
+    uint16_t voltage_dv = (uint16_t)(voltage_mv / 100U);
+    uint16_t current_da = (uint16_t)(current_ma / 100U);
+    uint32_t capacity   = (capacity_mah > 0x00FFFFFFU) ? 0x00FFFFFFU : capacity_mah;
+
+    uint8_t *buf = h->crsf_tx_buffer;
+    buf[0] = RCBUS_CRSF_SYNC_BYTE;
+    buf[1] = (uint8_t)(RCBUS_CRSF_BATTERY_PAYLOAD_LEN + 2U); /* тип + payload + CRC */
+    buf[2] = RCBUS_CRSF_FRAMETYPE_BATTERY;
+    buf[3] = (uint8_t)(voltage_dv >> 8);
+    buf[4] = (uint8_t)voltage_dv;
+    buf[5] = (uint8_t)(current_da >> 8);
+    buf[6] = (uint8_t)current_da;
+    buf[7] = (uint8_t)(capacity >> 16);
+    buf[8] = (uint8_t)(capacity >> 8);
+    buf[9] = (uint8_t)capacity;
+    buf[10] = remaining_pct;
+    buf[11] = rcbus_crsf_crc8(&buf[2], (uint16_t)(RCBUS_CRSF_BATTERY_PAYLOAD_LEN + 1U));
+
+    h->tx_pending = 1U;
+    if (rcbus_is_half_duplex(h->config.huart) != 0U)
+    {
+        /* Приём и передача делят одну линию - останавливаем ещё активный
+         * DMA-приём перед переключением направления на передачу, иначе наш
+         * кадр пойдёт поверх незавершённого приёма следующего кадра каналов. */
+        (void)HAL_UART_AbortReceive(h->config.huart);
+        (void)HAL_HalfDuplex_EnableTransmitter(h->config.huart);
+    }
+    /* На обычной асинхронной линии (раздельные RX/TX) переключать нечего -
+     * приём каналов на RX-пине продолжается независимо от передачи на TX. */
+    (void)HAL_UART_Transmit_IT(h->config.huart, h->crsf_tx_buffer, (uint16_t)RCBUS_CRSF_TX_BUFFER_LEN);
+    return HAL_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /*  Обработчики, вызываемые ИЗ ВАШИХ HAL callback-ов                       */
 /* ------------------------------------------------------------------------ */
 
@@ -529,6 +599,15 @@ void RCBUS_UART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         if ((h->used == 0U) || (h->config.huart != huart))
         {
             continue; /* не наш экземпляр/слот пуст - фильтрация по полю хэндла */
+        }
+        if ((h->tx_pending != 0U) && (rcbus_is_half_duplex(huart) != 0U))
+        {
+            /* Идёт отправка нашей телеметрии по Half-Duplex линии - приёмник
+             * аппаратно отключён (HAL_HalfDuplex_EnableTransmitter), событие
+             * не может быть новым кадром - игнорируем без перезапуска приёма
+             * (это сделает RCBUS_UART_TxCpltCallback). На обычной асинхронной
+             * линии это условие никогда не выполняется - приём независим. */
+            continue;
         }
 
         uint8_t result;
@@ -575,10 +654,35 @@ void RCBUS_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
         h->error_count++;
         RCBUS_LOG(LOG_CODE_RC_BUS_UART_ERROR, h->index, h->error_count);
+        h->tx_pending = 0U; /* на случай, если ошибка застала посреди отправки телеметрии */
         /* DMA-приём после ошибки USART (overrun/framing/noise) сам себя не
          * восстанавливает - обязательно останавливаем и перезапускаем, иначе
-         * приём каналов "зависает" молча после первой же помехи на линии. */
+         * приём каналов "зависает" молча после первой же помехи на линии.
+         * rcbus_restart_reception() заодно вернёт направление на приём, если
+         * ошибка застала линию Half-Duplex в режиме передачи. */
         (void)HAL_UART_AbortReceive(huart);
         rcbus_restart_reception(h);
+    }
+}
+
+void RCBUS_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    for (uint32_t i = 0U; i < RCBUS_MAX_INSTANCES; i++)
+    {
+        RCBUS_Handle_t *h = &s_pool[i];
+        if ((h->used == 0U) || (h->config.huart != huart) || (h->tx_pending == 0U))
+        {
+            continue; /* не наш экземпляр, либо это не наша передача завершилась */
+        }
+
+        h->tx_pending = 0U;
+        if (rcbus_is_half_duplex(huart) != 0U)
+        {
+            /* Переключаем направление обратно на приём и перезапускаем его -
+             * он был остановлен (HAL_UART_AbortReceive) перед передачей. */
+            rcbus_restart_reception(h);
+        }
+        /* На обычной асинхронной линии приём никогда не останавливался -
+         * перезапускать нечего, снятого выше tx_pending достаточно. */
     }
 }

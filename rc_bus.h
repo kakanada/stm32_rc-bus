@@ -2,11 +2,11 @@
  ******************************************************************************
  * @file    rc_bus.h
  * @brief   Приём каналов радиоуправления по FlySky i-BUS / Futaba S.BUS /
- *          CRSF через аппаратный UART/DMA. Телеметрия i-BUS - см.
- *          rc_bus_telemetry.h.
+ *          CRSF через аппаратный UART/DMA, плюс исходящая телеметрия CRSF
+ *          (датчик батареи). Телеметрия i-BUS - см. rc_bus_telemetry.h.
  * @author  Mechanic
- * @date    23.09.2026
- * @version 0.8
+ * @date    30.09.2026
+ * @version 0.9
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -70,6 +70,11 @@ extern "C" {
  *  LINK_STATISTICS - не переполняли буфер DMA). */
 #define RCBUS_RX_BUFFER_LEN          64U
 
+/** Размер буфера исходящей телеметрии CRSF - под кадр "датчик батареи"
+ *  (адрес+длина+тип+8 байт данных+CRC = 12 байт), единственный пока
+ *  реализованный тип исходящего кадра CRSF (см. RCBUS_CRSF_SendBatteryTelemetry()). */
+#define RCBUS_CRSF_TX_BUFFER_LEN     12U
+
 /* ------------------------------------------------------------------------ */
 /*  Необязательная интеграция с stm32_logger                                */
 /* ------------------------------------------------------------------------ */
@@ -114,7 +119,9 @@ typedef struct
      *  проинициализирован CubeMX-кодом (HAL_UART_Init() либо
      *  HAL_HalfDuplex_Init() - обычный асинхронный режим и аппаратный
      *  Half-Duplex/Single Wire одинаково поддержаны для любого протокола,
-     *  модуль только принимает и ему не важно, какой из двух выбран) с
+     *  приём каналов не зависит от того, какой из двух выбран; для
+     *  исходящей телеметрии CRSF - см. RCBUS_CRSF_SendBatteryTelemetry() -
+     *  режим тоже не важен, но нужен ещё и RCBUS_UART_TxCpltCallback()) с
      *  параметрами линии, соответствующими выбранному protocol (см. таблицу
      *  в README.md) - RCBUS_Init() проверяет это и вернёт NULL при
      *  несоответствии. */
@@ -179,6 +186,8 @@ typedef struct
     uint32_t  effective_failsafe_timeout_ms;      /* config.failsafe_timeout_ms с учётом подстановки по умолчанию */
     uint8_t   sbus_frame_lost_flag;               /* бит "frame lost" из последнего валидного кадра S.BUS */
     uint8_t   sbus_failsafe_flag;                 /* бит "failsafe" из последнего валидного кадра S.BUS */
+    uint8_t   tx_pending;                         /* идёт передача исходящей телеметрии CRSF (буфер занят) */
+    uint8_t   crsf_tx_buffer[RCBUS_CRSF_TX_BUFFER_LEN]; /* буфер исходящей телеметрии CRSF */
 } RCBUS_Handle_t;
 
 /* ------------------------------------------------------------------------ */
@@ -241,6 +250,34 @@ uint8_t RCBUS_IsFrameLost(const RCBUS_Handle_t *h);
 uint8_t RCBUS_IsFailsafe(const RCBUS_Handle_t *h);
 
 /* ------------------------------------------------------------------------ */
+/*  Исходящая телеметрия CRSF (только для protocol == RCBUS_PROTOCOL_CRSF)  */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * @brief  Неблокирующе отправляет приёмнику кадр телеметрии CRSF "датчик
+ *         батареи" (тип 0x08) - приёмник ретранслирует его по радиоканалу на
+ *         экран пульта. Значения, которые не отслеживаете, передавайте 0 -
+ *         это валидное "не измеряется" для данного типа кадра. Требует
+ *         подключённого RCBUS_UART_TxCpltCallback() в вашем
+ *         HAL_UART_TxCpltCallback() - без него на линии Half-Duplex приёмник
+ *         канала останется выключенным после первой же отправки.
+ * @param  h             хэндл экземпляра (обязан быть RCBUS_PROTOCOL_CRSF)
+ * @param  voltage_mv    напряжение батареи, мВ (в кадре передаётся с
+ *                        точностью 100 мВ - младшие разряды теряются)
+ * @param  current_ma    ток потребления, мА (аналогично, точность 100 мА)
+ * @param  capacity_mah  израсходованная ёмкость, мА*ч (обрезается до 24 бит,
+ *                        макс. 16777215)
+ * @param  remaining_pct остаток заряда, % (0..100)
+ * @retval HAL_OK; HAL_ERROR, если h == NULL, protocol не CRSF, либо
+ *         предыдущая отправка телеметрии ещё не завершена
+ */
+HAL_StatusTypeDef RCBUS_CRSF_SendBatteryTelemetry(RCBUS_Handle_t *h,
+                                                   uint16_t voltage_mv,
+                                                   uint16_t current_ma,
+                                                   uint32_t capacity_mah,
+                                                   uint8_t remaining_pct);
+
+/* ------------------------------------------------------------------------ */
 /*  Обработчики, вызываемые ИЗ ВАШИХ HAL callback-ов                       */
 /* ------------------------------------------------------------------------ */
 
@@ -262,6 +299,18 @@ void RCBUS_UART_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
  * @param  huart  хэндл UART, пришедший в ваш HAL-колбэк как есть
  */
 void RCBUS_UART_ErrorCallback(UART_HandleTypeDef *huart);
+
+/**
+ * @brief  Обработчик завершения передачи - вызывайте из своего
+ *         HAL_UART_TxCpltCallback(). ОБЯЗАТЕЛЕН, если хоть раз вызывается
+ *         RCBUS_CRSF_SendBatteryTelemetry() на этом huart (для остальных
+ *         случаев - можно не подключать). На линии Half-Duplex переключает
+ *         направление обратно на приём и перезапускает его; на обычной
+ *         асинхронной линии приём никогда не останавливался, поэтому только
+ *         снимает внутренний признак "передача занята".
+ * @param  huart  хэндл UART, пришедший в ваш HAL-колбэк как есть
+ */
+void RCBUS_UART_TxCpltCallback(UART_HandleTypeDef *huart);
 
 #ifdef __cplusplus
 }
