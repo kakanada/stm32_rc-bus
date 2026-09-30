@@ -5,7 +5,7 @@
  *          (см. rc_bus.h).
  * @author  Mechanic
  * @date    30.09.2026
- * @version 0.9
+ * @version 0.10
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -35,7 +35,7 @@
 #define RCBUS_CRSF_FRAMETYPE_CHANNELS   0x16U  /* байт2: тип кадра RC_CHANNELS_PACKED */
 #define RCBUS_CRSF_CHANNELS_PAYLOAD_LEN 22U    /* 16 каналов x 11 бит = 22 байта данных */
 
-#define RCBUS_CRSF_FRAMETYPE_BATTERY    0x08U  /* тип исходящего кадра "датчик батареи" */
+/* RCBUS_CRSF_FRAMETYPE_BATTERY (0x08) - см. публичный enum RCBUS_CRSF_FrameType_t в rc_bus.h */
 #define RCBUS_CRSF_BATTERY_PAYLOAD_LEN  8U     /* напряжение(2)+ток(2)+ёмкость(3)+остаток(1) */
 
 /* Бит регистра CR3, включающий аппаратный режим Half-Duplex (Single Wire) -
@@ -537,40 +537,39 @@ uint8_t RCBUS_IsFailsafe(const RCBUS_Handle_t *h)
 /*  Исходящая телеметрия CRSF                                               */
 /* ------------------------------------------------------------------------ */
 
-HAL_StatusTypeDef RCBUS_CRSF_SendBatteryTelemetry(RCBUS_Handle_t *h,
-                                                   uint16_t voltage_mv,
-                                                   uint16_t current_ma,
-                                                   uint32_t capacity_mah,
-                                                   uint8_t remaining_pct)
+HAL_StatusTypeDef RCBUS_CRSF_SendFrame(RCBUS_Handle_t *h,
+                                        RCBUS_CRSF_FrameType_t frame_type,
+                                        const uint8_t *payload,
+                                        uint8_t payload_len)
 {
     if ((h == NULL) || (h->config.protocol != RCBUS_PROTOCOL_CRSF))
     {
         return HAL_ERROR;
+    }
+    if ((payload == NULL) && (payload_len != 0U))
+    {
+        return HAL_ERROR;
+    }
+    /* Итоговый кадр: адрес(1) + длина(1) + тип(1) + payload + CRC(1). */
+    uint16_t frame_len_total = (uint16_t)(payload_len + 4U);
+    if (frame_len_total > RCBUS_CRSF_TX_BUFFER_LEN)
+    {
+        return HAL_ERROR; /* payload не помещается в буфер */
     }
     if (h->tx_pending != 0U)
     {
         return HAL_ERROR; /* предыдущая отправка телеметрии ещё не завершена */
     }
 
-    /* Поля кадра CRSF "датчик батареи" - big-endian, напряжение/ток в
-     * единицах 0.1 В / 0.1 А (децивольты/дециамперы), ёмкость 24 бита. */
-    uint16_t voltage_dv = (uint16_t)(voltage_mv / 100U);
-    uint16_t current_da = (uint16_t)(current_ma / 100U);
-    uint32_t capacity   = (capacity_mah > 0x00FFFFFFU) ? 0x00FFFFFFU : capacity_mah;
-
     uint8_t *buf = h->crsf_tx_buffer;
     buf[0] = RCBUS_CRSF_SYNC_BYTE;
-    buf[1] = (uint8_t)(RCBUS_CRSF_BATTERY_PAYLOAD_LEN + 2U); /* тип + payload + CRC */
-    buf[2] = RCBUS_CRSF_FRAMETYPE_BATTERY;
-    buf[3] = (uint8_t)(voltage_dv >> 8);
-    buf[4] = (uint8_t)voltage_dv;
-    buf[5] = (uint8_t)(current_da >> 8);
-    buf[6] = (uint8_t)current_da;
-    buf[7] = (uint8_t)(capacity >> 16);
-    buf[8] = (uint8_t)(capacity >> 8);
-    buf[9] = (uint8_t)capacity;
-    buf[10] = remaining_pct;
-    buf[11] = rcbus_crsf_crc8(&buf[2], (uint16_t)(RCBUS_CRSF_BATTERY_PAYLOAD_LEN + 1U));
+    buf[1] = (uint8_t)(payload_len + 2U); /* тип + payload + CRC */
+    buf[2] = (uint8_t)frame_type;
+    for (uint8_t i = 0U; i < payload_len; i++)
+    {
+        buf[3U + i] = payload[i];
+    }
+    buf[3U + payload_len] = rcbus_crsf_crc8(&buf[2], (uint16_t)(payload_len + 1U));
 
     h->tx_pending = 1U;
     if (rcbus_is_half_duplex(h->config.huart) != 0U)
@@ -583,8 +582,33 @@ HAL_StatusTypeDef RCBUS_CRSF_SendBatteryTelemetry(RCBUS_Handle_t *h,
     }
     /* На обычной асинхронной линии (раздельные RX/TX) переключать нечего -
      * приём каналов на RX-пине продолжается независимо от передачи на TX. */
-    (void)HAL_UART_Transmit_IT(h->config.huart, h->crsf_tx_buffer, (uint16_t)RCBUS_CRSF_TX_BUFFER_LEN);
+    (void)HAL_UART_Transmit_IT(h->config.huart, h->crsf_tx_buffer, frame_len_total);
     return HAL_OK;
+}
+
+HAL_StatusTypeDef RCBUS_CRSF_SendBatteryTelemetry(RCBUS_Handle_t *h,
+                                                   uint16_t voltage_mv,
+                                                   uint16_t current_ma,
+                                                   uint32_t capacity_mah,
+                                                   uint8_t remaining_pct)
+{
+    /* Поля кадра CRSF "датчик батареи" - big-endian, напряжение/ток в
+     * единицах 0.1 В / 0.1 А (децивольты/дециамперы), ёмкость 24 бита. */
+    uint16_t voltage_dv = (uint16_t)(voltage_mv / 100U);
+    uint16_t current_da = (uint16_t)(current_ma / 100U);
+    uint32_t capacity   = (capacity_mah > 0x00FFFFFFU) ? 0x00FFFFFFU : capacity_mah;
+
+    uint8_t payload[RCBUS_CRSF_BATTERY_PAYLOAD_LEN];
+    payload[0] = (uint8_t)(voltage_dv >> 8);
+    payload[1] = (uint8_t)voltage_dv;
+    payload[2] = (uint8_t)(current_da >> 8);
+    payload[3] = (uint8_t)current_da;
+    payload[4] = (uint8_t)(capacity >> 16);
+    payload[5] = (uint8_t)(capacity >> 8);
+    payload[6] = (uint8_t)capacity;
+    payload[7] = remaining_pct;
+
+    return RCBUS_CRSF_SendFrame(h, RCBUS_CRSF_FRAMETYPE_BATTERY, payload, RCBUS_CRSF_BATTERY_PAYLOAD_LEN);
 }
 
 /* ------------------------------------------------------------------------ */

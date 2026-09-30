@@ -3,10 +3,11 @@
  * @file    rc_bus.h
  * @brief   Приём каналов радиоуправления по FlySky i-BUS / Futaba S.BUS /
  *          CRSF через аппаратный UART/DMA, плюс исходящая телеметрия CRSF
- *          (датчик батареи). Телеметрия i-BUS - см. rc_bus_telemetry.h.
+ *          (датчик батареи и произвольные кадры). Телеметрия i-BUS - см.
+ *          rc_bus_telemetry.h.
  * @author  Mechanic
  * @date    30.09.2026
- * @version 0.9
+ * @version 0.10
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
@@ -70,10 +71,13 @@ extern "C" {
  *  LINK_STATISTICS - не переполняли буфер DMA). */
 #define RCBUS_RX_BUFFER_LEN          64U
 
-/** Размер буфера исходящей телеметрии CRSF - под кадр "датчик батареи"
- *  (адрес+длина+тип+8 байт данных+CRC = 12 байт), единственный пока
- *  реализованный тип исходящего кадра CRSF (см. RCBUS_CRSF_SendBatteryTelemetry()). */
-#define RCBUS_CRSF_TX_BUFFER_LEN     12U
+/** Размер буфера исходящей телеметрии CRSF - вмещает кадр "датчик батареи"
+ *  (12 байт целиком, см. RCBUS_CRSF_SendBatteryTelemetry()) и оставляет запас
+ *  под произвольные кадры через RCBUS_CRSF_SendFrame() (payload до
+ *  RCBUS_CRSF_TX_BUFFER_LEN - 4 байт - этого достаточно на все стандартные
+ *  типы кадров телеметрии CRSF, включая самый длинный из распространённых,
+ *  GPS, 15 байт). */
+#define RCBUS_CRSF_TX_BUFFER_LEN     32U
 
 /* ------------------------------------------------------------------------ */
 /*  Необязательная интеграция с stm32_logger                                */
@@ -108,6 +112,23 @@ typedef enum
     RCBUS_PROTOCOL_SBUS = 1,   /**< Futaba S.BUS (и большинство совместимых)      */
     RCBUS_PROTOCOL_CRSF = 2,   /**< TBS Crossfire / ExpressLRS (CRSF)             */
 } RCBUS_Protocol_t;
+
+/** Известные типы исходящих (МК -> приёмник) кадров телеметрии/данных CRSF -
+ *  "id", который передаётся в RCBUS_CRSF_SendFrame(). Готовая функция-
+ *  обёртка в этой библиотеке есть только для RCBUS_CRSF_FRAMETYPE_BATTERY
+ *  (RCBUS_CRSF_SendBatteryTelemetry()) - для остальных вызывающий сам
+ *  формирует payload по официальной спецификации CRSF (github.com/
+ *  crsf-wg/crsf-spec) под нужный тип; библиотека лишь оборачивает его в
+ *  кадр (адрес/длина/CRC) и отправляет. */
+typedef enum
+{
+    RCBUS_CRSF_FRAMETYPE_GPS             = 0x02, /**< широта/долгота/скорость/курс/высота/спутники */
+    RCBUS_CRSF_FRAMETYPE_VARIO           = 0x07, /**< вертикальная скорость                        */
+    RCBUS_CRSF_FRAMETYPE_BATTERY         = 0x08, /**< см. RCBUS_CRSF_SendBatteryTelemetry()         */
+    RCBUS_CRSF_FRAMETYPE_BARO_ALTITUDE   = 0x09, /**< барометрическая высота/вариометр              */
+    RCBUS_CRSF_FRAMETYPE_ATTITUDE        = 0x1E, /**< тангаж/крен/рысканье                          */
+    RCBUS_CRSF_FRAMETYPE_FLIGHT_MODE     = 0x21, /**< режим полёта строкой (ASCII + '\0')           */
+} RCBUS_CRSF_FrameType_t;
 
 /* ------------------------------------------------------------------------ */
 /*  Конфигурация одного экземпляра - заполняется пользователем             */
@@ -254,10 +275,39 @@ uint8_t RCBUS_IsFailsafe(const RCBUS_Handle_t *h);
 /* ------------------------------------------------------------------------ */
 
 /**
+ * @brief  Неблокирующе отправляет приёмнику произвольный кадр телеметрии/
+ *         данных CRSF заданного типа (см. RCBUS_CRSF_FrameType_t) с уже
+ *         готовым payload - низкоуровневая функция для типов кадров, не
+ *         имеющих отдельной обёртки в этой библиотеке (для "датчика батареи"
+ *         используйте более удобную RCBUS_CRSF_SendBatteryTelemetry() ниже -
+ *         она реализована поверх этой же функции). Вызывающий сам собирает
+ *         payload по официальной спецификации CRSF для выбранного frame_type
+ *         (порядок полей, байт-порядок, единицы измерения - для каждого типа
+ *         свои). Требует подключённого RCBUS_UART_TxCpltCallback() - см. её
+ *         описание ниже.
+ * @param  h            хэндл экземпляра (обязан быть RCBUS_PROTOCOL_CRSF)
+ * @param  frame_type   тип кадра (см. RCBUS_CRSF_FrameType_t)
+ * @param  payload      данные кадра (без адреса/длины/типа/CRC - только сами
+ *                       данные конкретного типа кадра), может быть NULL при
+ *                       payload_len == 0
+ * @param  payload_len  длина payload в байтах, максимум
+ *                       RCBUS_CRSF_TX_BUFFER_LEN - 4
+ * @retval HAL_OK; HAL_ERROR, если h == NULL, protocol не CRSF, payload_len
+ *         превышает вместимость буфера, либо предыдущая передача ещё не
+ *         завершена
+ */
+HAL_StatusTypeDef RCBUS_CRSF_SendFrame(RCBUS_Handle_t *h,
+                                        RCBUS_CRSF_FrameType_t frame_type,
+                                        const uint8_t *payload,
+                                        uint8_t payload_len);
+
+/**
  * @brief  Неблокирующе отправляет приёмнику кадр телеметрии CRSF "датчик
- *         батареи" (тип 0x08) - приёмник ретранслирует его по радиоканалу на
- *         экран пульта. Значения, которые не отслеживаете, передавайте 0 -
- *         это валидное "не измеряется" для данного типа кадра. Требует
+ *         батареи" (тип RCBUS_CRSF_FRAMETYPE_BATTERY) - приёмник
+ *         ретранслирует его по радиоканалу на экран пульта. Значения,
+ *         которые не отслеживаете, передавайте 0 - это валидное "не
+ *         измеряется" для данного типа кадра. Тонкая обёртка над
+ *         RCBUS_CRSF_SendFrame() - собирает payload и вызывает её. Требует
  *         подключённого RCBUS_UART_TxCpltCallback() в вашем
  *         HAL_UART_TxCpltCallback() - без него на линии Half-Duplex приёмник
  *         канала останется выключенным после первой же отправки.

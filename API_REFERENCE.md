@@ -84,6 +84,22 @@ CRSF](#исходящая-телеметрия-crsf)), пока не завер�
 | `RCBUS_PROTOCOL_SBUS` | Futaba S.BUS (и большинство совместимых)        |
 | `RCBUS_PROTOCOL_CRSF` | TBS Crossfire / ExpressLRS (CRSF)               |
 
+#### `RCBUS_CRSF_FrameType_t`
+
+Известные типы исходящих (МК → приёмник) кадров телеметрии/данных CRSF —
+`id`, передаётся в `RCBUS_CRSF_SendFrame()`. Готовая функция-обёртка есть
+только для `RCBUS_CRSF_FRAMETYPE_BATTERY` (`RCBUS_CRSF_SendBatteryTelemetry()`) —
+для остальных payload собирается вызывающим по спецификации CRSF.
+
+| Значение | Код | Смысл |
+|---|---|---|
+| `RCBUS_CRSF_FRAMETYPE_GPS` | `0x02` | широта/долгота/скорость/курс/высота/спутники |
+| `RCBUS_CRSF_FRAMETYPE_VARIO` | `0x07` | вертикальная скорость |
+| `RCBUS_CRSF_FRAMETYPE_BATTERY` | `0x08` | см. `RCBUS_CRSF_SendBatteryTelemetry()` |
+| `RCBUS_CRSF_FRAMETYPE_BARO_ALTITUDE` | `0x09` | барометрическая высота/вариометр |
+| `RCBUS_CRSF_FRAMETYPE_ATTITUDE` | `0x1E` | тангаж/крен/рысканье |
+| `RCBUS_CRSF_FRAMETYPE_FLIGHT_MODE` | `0x21` | режим полёта строкой (ASCII + `\0`) |
+
 #### `RCBUS_Config_t`
 
 | Поле | Тип | Описание |
@@ -149,6 +165,23 @@ CRSF](#исходящая-телеметрия-crsf)), пока не завер�
 
 Только для экземпляров с `protocol == RCBUS_PROTOCOL_CRSF` — на i-BUS/S.BUS
 не действует.
+
+#### `HAL_StatusTypeDef RCBUS_CRSF_SendFrame(RCBUS_Handle_t *h, RCBUS_CRSF_FrameType_t frame_type, const uint8_t *payload, uint8_t payload_len)`
+
+Низкоуровневая функция — неблокирующе оборачивает готовый `payload` в кадр
+CRSF (адрес/длина/CRC) заданного `frame_type` и отправляет. Вызывающий сам
+собирает `payload` по официальной спецификации CRSF для выбранного типа —
+библиотека не знает формат payload ни для одного типа, кроме `BATTERY`
+(обёртка `RCBUS_CRSF_SendBatteryTelemetry()` ниже реализована поверх этой же
+функции). `payload` может быть `NULL` при `payload_len == 0`.
+
+`payload_len` — максимум `RCBUS_CRSF_TX_BUFFER_LEN - 4` (по умолчанию 28
+байт — хватает на все распространённые типы телеметрии CRSF, включая самый
+длинный из них, GPS, 15 байт).
+
+Возвращает `HAL_OK`; `HAL_ERROR`, если `h == NULL`, `protocol` не CRSF,
+`payload_len` превышает вместимость буфера, либо предыдущая передача ещё не
+завершена. Требует подключённого `RCBUS_UART_TxCpltCallback()` (см. ниже).
 
 #### `HAL_StatusTypeDef RCBUS_CRSF_SendBatteryTelemetry(RCBUS_Handle_t *h, uint16_t voltage_mv, uint16_t current_ma, uint32_t capacity_mah, uint8_t remaining_pct)`
 
@@ -336,9 +369,11 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   сверяясь с таблицей вашего приложения передатчика.
 - Требуется HAL с `HAL_UARTEx_ReceiveToIdle_DMA()`.
 - Инверсия сигнала S.BUS — только аппаратная (см. раздел про настройку UART).
-- Исходящая телеметрия CRSF реализована только одним типом кадра — "датчик
-  батареи" (см. `RCBUS_CRSF_SendBatteryTelemetry()`). Другие типы (GPS,
-  высотомер, ориентация, режим полёта и т.п.) не реализованы; периодичность
+- Готовая функция-обёртка для исходящей телеметрии CRSF есть только для
+  "датчика батареи" (`RCBUS_CRSF_SendBatteryTelemetry()`); прочие типы (GPS,
+  высотомер, ориентация, режим полёта и т.п.) отправляются через
+  низкоуровневую `RCBUS_CRSF_SendFrame()` с payload, собранным вызывающим
+  самостоятельно — библиотека не знает формат payload для них. Периодичность
   отправки — на приложении, автоматической рассылки по таймеру нет.
 - Принимаемые кадры CRSF других типов (например, `LINK_STATISTICS`)
   распознаются и корректно пропускаются, но не разбираются — данные из них
