@@ -6,8 +6,8 @@
  *          (датчик батареи и произвольные кадры). Телеметрия i-BUS - см.
  *          rc_bus_telemetry.h.
  * @author  Mechanic
- * @date    30.09.2026
- * @version 0.10
+ * @date    01.10.2026
+ * @version 0.11
  *
  * @copyright Copyright (c) 2026 Mechanic.
  *            Свободное некоммерческое использование и модификация. Условия
